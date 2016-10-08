@@ -185,6 +185,14 @@ class Database db where
    deleteItem :: db -> Id db -> IO db
    -- |Adds an item to the database.
    addItem :: db -> DBItem db -> IO ((db, Id db))
+   -- |Adds a list of items to the database. The default implementation uses
+   --  'addItem'.
+   addItems :: db -> [DBItem db] -> IO (db, [Id db])
+   addItems db [] = return (db, [])
+   addItems db (x:xs) = do
+      (db', id) <- addItem db x
+      (db'', ids) <- addItems db' xs
+      return (db'', id : ids)
    -- |Updates an item in the datavase.
    updateItem :: db -> Id db -> (DBItem db -> DBItem db) -> IO db
 
