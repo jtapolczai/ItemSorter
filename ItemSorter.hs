@@ -11,11 +11,12 @@ import Data.Char (toLower)
 import qualified Data.Map as M
 import Data.List (sortBy, partition)
 import Data.Ord (comparing)
-import Data.Text (Text)
-import qualified Data.Time as T
+import qualified Data.Text as T
+import qualified Data.Time as Time
 import qualified Database.SQLite.Simple as SQL
 import qualified Database.SQLite.Simple.FromField as SQL
 import qualified Database.SQLite.Simple.Ok as SQL
+import qualified Database.SQLite.Simple.ToField as SQL
 import qualified Text.Parsec as P
 import System.IO (openFile, hPutStrLn, IOMode(..))
 import System.REPL
@@ -72,7 +73,7 @@ mkMaxDate = Date 9999 31 12
 -- |Returns the current system date.
 mkCurrentDate :: IO Date
 mkCurrentDate = do
-   (y,m,d) <- T.toGregorian . T.utctDay <$> T.getCurrentTime
+   (y,m,d) <- Time.toGregorian . Time.utctDay <$> Time.getCurrentTime
    return $ Date (fromIntegral y) m d
 
 isValidYear :: Year -> Bool
@@ -244,8 +245,28 @@ instance SQL.FromField ContainerType where
                             "ContainerType"
                             "Couldn't parse the container type."]
 
+
+
+instance SQL.ToField ContainerType where
+   toField Bag = SQL.SQLText "bag"
+   toField Bar = SQL.SQLText "bar"
+   toField Can = SQL.SQLText "can"
+   toField Jar = SQL.SQLText "jar"
+   toField Pack = SQL.SQLText "pack"
+
+instance SQL.ToField Date where
+   toField (Date y m d) = SQL.SQLText $ T.pack $ mconcat
+                             [show d,
+                              ".",
+                              show m,
+                              ".",
+                              show y]
+
 instance SQL.FromRow ItemWithID where
    fromRow = ItemWithID <$> SQL.field <*> SQL.field <*> SQL.field <*> SQL.field
+
+instance SQL.ToRow ItemWithID where
+   toRow (ItemWithID id name ct qty) = SQL.toRow (id, name, ct, qty)
 
 -- App state
 -------------------------------------------------------------------------------
@@ -299,7 +320,7 @@ main = do
       repl :: StateT AppState IO ()
       repl = makeREPLSimple [cmdShow, cmdConsume, cmdSave]
 
-      cmdShow :: Command (StateT AppState IO) Text ()
+      cmdShow :: Command (StateT AppState IO) T.Text ()
       cmdShow = makeCommand
          "show"
          (defCommandTest ["show"])
@@ -318,7 +339,7 @@ main = do
             liftIO $ putStrLn "------------------------------"
             mapM_ (liftIO . putStrLn . show') good)
 
-      cmdConsume :: Command (StateT AppState IO) Text ()
+      cmdConsume :: Command (StateT AppState IO) T.Text ()
       cmdConsume = makeCommand2
          "consume"
          (defCommandTest ["consume <ID> <num>"])
@@ -343,7 +364,7 @@ main = do
                         liftIO $ putStrLn
                                $ mconcat [show $ _itemQuantity item, " remain."])
 
-      cmdSave :: Command (StateT AppState IO) Text ()
+      cmdSave :: Command (StateT AppState IO) T.Text ()
       cmdSave = makeCommand
          "save"
          (defCommandTest ["save"])
