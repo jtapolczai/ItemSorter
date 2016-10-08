@@ -4,6 +4,7 @@
 module ItemSorter where
 
 -- import Control.Arrow (right)
+import Control.Exception (SomeException(..))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.State (StateT(..), evalStateT, get, put)
 import Data.Char (toLower)
@@ -12,6 +13,9 @@ import Data.List (sortBy, partition)
 import Data.Ord (comparing)
 import Data.Text (Text)
 import qualified Data.Time as T
+import qualified Database.SQLite.Simple as SQL
+import qualified Database.SQLite.Simple.FromField as SQL
+import qualified Database.SQLite.Simple.Ok as SQL
 import qualified Text.Parsec as P
 import System.IO (openFile, hPutStrLn, IOMode(..))
 import System.REPL
@@ -158,22 +162,26 @@ class Database db where
    type Id db :: *
    -- |Loads the database.
    loadItems :: db -> IO db
-   -- |Writes the database back to file.
+   -- |Writes the database back. Only this operation is required to
+   --  persist the data so it can be loaded back later.
    persistItems :: db -> IO ()
    -- |Filters the database.
-   selectItems :: (DBItem db -> Bool) -> db -> DBItems db
+   selectItems :: (DBItem db -> Bool) -> db -> IO (DBItems db)
    -- |Gets all items.
-   getItems :: db -> DBItems db
+   getItems :: db -> IO (DBItems db)
    getItems = selectItems (const True)
    -- |Gets a single item.
-   getItem :: Id db -> db -> Maybe (DBItem db)
+   getItem :: Id db -> db -> IO (Maybe (DBItem db))
    -- |Deletes an item from the database.
-   deleteItem :: db -> Id db -> db
+   deleteItem :: db -> Id db -> IO (db)
    -- |Adds an item to the database.
-   addItem :: db -> DBItem db -> (db, Id db)
+   addItem :: db -> DBItem db -> IO ((db, Id db))
    -- |Updates an item in the datavase.
-   updateItem :: db -> Id db -> (DBItem db -> DBItem db) -> db
+   updateItem :: db -> Id db -> (DBItem db -> DBItem db) -> IO (db)
 
+
+-- CSV DB
+-------------------------------------------------------------------------------
 
 -- |A CSV database.
 data CSVDB = CSVDB String (M.Map ID Item)
@@ -182,6 +190,7 @@ instance Database CSVDB where
    type DBItems CSVDB = M.Map ID Item
    type DBItem CSVDB = Item
    type Id CSVDB = Int
+
 
    loadItems (CSVDB fp db) = do
       items <- readItemList fp
@@ -193,13 +202,14 @@ instance Database CSVDB where
       out <- openFile fp WriteMode
       mapM_ (hPutStrLn out) . map itemAsCSV . M.toList $ db
 
-   selectItems f (CSVDB _ db) = M.filter f db
-   getItem id (CSVDB _ db) = M.lookup id db
-   deleteItem (CSVDB fp db) id = CSVDB fp (M.delete id db)
-   addItem (CSVDB fp db) item = (CSVDB fp (M.insert newId item db), newId)
+   selectItems f (CSVDB _ db) = return $ M.filter f db
+   getItem id (CSVDB _ db) = return $ M.lookup id db
+
+   deleteItem (CSVDB fp db) id = return $ CSVDB fp (M.delete id db)
+   addItem (CSVDB fp db) item = return $ (CSVDB fp (M.insert newId item db), newId)
       where
          newId = if M.null db then 0 else (+1) . fst . M.findMax $ db
-   updateItem (CSVDB fp db) id f = CSVDB fp (M.adjust f id db)
+   updateItem (CSVDB fp db) id f = return $ CSVDB fp (M.adjust f id db)
 
 
 -- |Reads an item list from a file and returns the items in a map.
@@ -213,6 +223,30 @@ itemAsCSV (id, Item name contype qty exp) = mconcat
    where
       showCT = map toLower . show
 
+-- SQLite DB
+-------------------------------------------------------------------------------
+
+-- |An SQLite database.
+data SQLiteDB = SQLiteDB FilePath (Maybe SQL.Connection)
+
+data ItemWithID = ItemWithID ID String ContainerType Int
+
+instance SQL.FromField ContainerType where
+   fromField a = case SQL.fieldData a of
+      SQL.SQLText "bag" -> SQL.Ok Bag
+      SQL.SQLText "bar" -> SQL.Ok Bar
+      SQL.SQLText "can" -> SQL.Ok Can
+      SQL.SQLText "jar" -> SQL.Ok Jar
+      SQL.SQLText "pack" -> SQL.Ok Pack
+      _ -> SQL.Errors [SomeException
+                       $ SQL.ConversionFailed
+                            "String"
+                            "ContainerType"
+                            "Couldn't parse the container type."]
+
+instance SQL.FromRow ItemWithID where
+   fromRow = ItemWithID <$> SQL.field <*> SQL.field <*> SQL.field <*> SQL.field
+
 -- App state
 -------------------------------------------------------------------------------
 
@@ -220,13 +254,15 @@ getAppState :: IO AppState
 getAppState = AppState <$> loadItems (CSVDB "food.csv" M.empty)
 
 -- |Consume n units of an item.
-consumeItem :: (Database db, DBItem db ~ Item) => Int -> Id db -> db -> db
-consumeItem num id db = case getItem id db of
-   Nothing -> db
-   Just item ->
-      if num >= _itemQuantity item
-      then deleteItem db id
-      else updateItem db id reduceQty
+consumeItem :: (Database db, DBItem db ~ Item) => Int -> Id db -> db -> IO db
+consumeItem num id db = do
+   item' <- getItem id db
+   case item' of
+      Nothing -> return db
+      Just item ->
+         if num >= _itemQuantity item
+         then deleteItem db id
+         else updateItem db id reduceQty
    where
       reduceQty x@Item{_itemQuantity=qty} = x{_itemQuantity = qty - num}
 
@@ -270,7 +306,7 @@ main = do
          "Shows the list of expired and still good items."
          (\_ -> do
             today <- liftIO mkCurrentDate
-            items <- getItems . _appStateDB <$> get
+            items <- (_appStateDB <$> get) >>= liftIO . getItems
             let (good, expired) = itemsByExpiration today items
                 show' (id, item) = mconcat [padLeft 3 ' ' (show id),
                                    " - ",
@@ -292,18 +328,20 @@ main = do
          (posNumAsker "Number of consumed items: ")
          (\_ id num -> do
             db <- _appStateDB <$> get
-            case getItem id db of
+            item' <- liftIO $ getItem id db
+            case item' of
                Nothing -> liftIO $ putStrLn ("There's no item with the ID " ++ show id)
                Just item -> do
                   liftIO $ putStr
                          $ mconcat ["Eating ", show num, " of ", _itemName item, "... "]
-                  let db' = consumeItem num id db
+                  db' <- liftIO $ consumeItem num id db
                   put $ AppState db'
-                  case getItem id db' of
+                  item' <- liftIO $ getItem id db'
+                  case item' of
                      Nothing -> liftIO $ putStrLn "none remain."
-                     Just item' ->
+                     Just item ->
                         liftIO $ putStrLn
-                               $ mconcat [show $ _itemQuantity item', " remain."])
+                               $ mconcat [show $ _itemQuantity item, " remain."])
 
       cmdSave :: Command (StateT AppState IO) Text ()
       cmdSave = makeCommand
