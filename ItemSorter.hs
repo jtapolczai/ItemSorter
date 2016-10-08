@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings,
+             ScopedTypeVariables,
              TypeFamilies #-}
 
 module ItemSorter where
@@ -8,6 +9,7 @@ import Control.Exception (SomeException(..))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.State (StateT(..), evalStateT, get, put)
 import Data.Char (toLower)
+import Data.Int (Int64)
 import qualified Data.Map as M
 import Data.List (sortBy, partition)
 import Data.Ord (comparing)
@@ -26,7 +28,7 @@ import System.REPL
 -------------------------------------------------------------------------------
 
 type ItemName = String
-type ID = Int
+type ID = Int64
 
 type Day = Int
 type Month = Int
@@ -103,7 +105,7 @@ isLeapYear y =
 
 readItem :: P.Parsec T.Text () (ID, Item)
 readItem = do
-   iid <- decimal
+   iid <- decimal64
    P.char ';'
    qty <- decimal
    P.char ';'
@@ -145,6 +147,9 @@ readIndefinite = do
 
 decimal :: P.Parsec T.Text () Int
 decimal = read <$> P.many1 P.digit
+
+decimal64 :: P.Parsec T.Text () Int64
+decimal64 = read <$> P.many1 P.digit
 
 readItems :: P.Parsec T.Text () (M.Map ID Item)
 readItems = M.fromList <$> P.many readItem
@@ -191,8 +196,7 @@ data CSVDB = CSVDB String (M.Map ID Item)
 instance Database CSVDB where
    type DBItems CSVDB = M.Map ID Item
    type DBItem CSVDB = Item
-   type Id CSVDB = Int
-
+   type Id CSVDB = Int64
 
    loadItems (CSVDB fp db) = do
       items <- readItemList fp
@@ -219,7 +223,7 @@ readItemList :: FilePath -> IO (Either P.ParseError (M.Map ID Item))
 readItemList fp = P.parse readItems fp <$> T.readFile fp
 
 -- |Outputs an item and an ID as a line in a CSV-file.
-itemAsCSV :: (Int, Item) -> String
+itemAsCSV :: (Int64, Item) -> String
 itemAsCSV (id, Item name contype qty exp) = mconcat
    [show id,";",show qty,";",showCT contype,";", name, showDate exp]
    where
@@ -275,6 +279,13 @@ instance SQL.FromRow ItemWithID where
 
 instance SQL.ToRow ItemWithID where
    toRow (ItemWithID id name ct qty date) = SQL.toRow (id, name, ct, qty, date)
+
+instance Database SQLiteDB where
+   type DBItems SQLiteDB = M.Map ID Item
+   type DBItem SQLiteDB = Item
+   type Id SQLiteDB = Int64
+
+
 
 -- App state
 -------------------------------------------------------------------------------
@@ -355,7 +366,7 @@ main = do
          True
          (posNumAsker "Item ID: ")
          (posNumAsker "Number of consumed items: ")
-         (\_ id num -> do
+         (\_ (id :: Int64) num -> do
             db <- _appStateDB <$> get
             item' <- liftIO $ getItem id db
             case item' of
@@ -381,7 +392,7 @@ main = do
             db <- _appStateDB <$> get
             liftIO $ persistItems db)
 
-      posNumAsker :: Applicative m => PromptMsg -> Asker' m Int
+      posNumAsker :: (Read a, Integral a, Applicative m) => PromptMsg -> Asker' m a
       posNumAsker pr = asker pr genericTypeError isPositive
          where
             isPositive = boolPredicate isPos (const $ genericPredicateError "Expected a natural number!")
