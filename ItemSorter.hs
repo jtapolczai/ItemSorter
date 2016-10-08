@@ -12,6 +12,7 @@ import qualified Data.Map as M
 import Data.List (sortBy, partition)
 import Data.Ord (comparing)
 import qualified Data.Text as T
+import qualified Data.Text.IO as T (readFile)
 import qualified Data.Time as Time
 import qualified Database.SQLite.Simple as SQL
 import qualified Database.SQLite.Simple.FromField as SQL
@@ -100,7 +101,7 @@ isLeapYear y =
 -- Parsers
 -------------------------------------------------------------------------------
 
-readItem :: P.Parsec String () (ID, Item)
+readItem :: P.Parsec T.Text () (ID, Item)
 readItem = do
    iid <- decimal
    P.char ';'
@@ -114,7 +115,7 @@ readItem = do
    P.endOfLine
    return $ (iid, Item name contype qty expiration)
 
-readContainerType :: P.Parsec String () ContainerType
+readContainerType :: P.Parsec T.Text () ContainerType
 readContainerType =
    P.try (P.string "bag" >> return Bag)
    P.<|> P.try (P.string "bar" >> return Bar)
@@ -122,7 +123,7 @@ readContainerType =
    P.<|> (P.string "jar" >> return Jar)
    P.<|> (P.string "pack" >> return Pack)
 
-readDate :: P.Parsec String () Date
+readDate :: P.Parsec T.Text () Date
 readDate = do
    comp1 <- decimal
    comp2 <- P.try $ P.optionMaybe readComp
@@ -133,19 +134,19 @@ readDate = do
          (Nothing, Nothing) -> mkVagueDate comp1 Nothing Nothing
    maybe (P.unexpected "invalid date") return ret
    where
-      readComp :: P.Parsec String () Int
+      readComp :: P.Parsec T.Text () Int
       readComp = do P.char '.'
                     decimal
 
-readIndefinite :: P.Parsec String () Date
+readIndefinite :: P.Parsec T.Text () Date
 readIndefinite = do
    P.string "indefinite"
    return mkMaxDate
 
-decimal :: P.Parsec String () Int
+decimal :: P.Parsec T.Text () Int
 decimal = read <$> P.many1 P.digit
 
-readItems :: P.Parsec String () (M.Map ID Item)
+readItems :: P.Parsec T.Text () (M.Map ID Item)
 readItems = M.fromList <$> P.many readItem
 
 -- |Pads a list to the specified length with copies of an element.
@@ -215,7 +216,7 @@ instance Database CSVDB where
 
 -- |Reads an item list from a file and returns the items in a map.
 readItemList :: FilePath -> IO (Either P.ParseError (M.Map ID Item))
-readItemList fp = P.parse readItems fp <$> readFile fp
+readItemList fp = P.parse readItems fp <$> T.readFile fp
 
 -- |Outputs an item and an ID as a line in a CSV-file.
 itemAsCSV :: (Int, Item) -> String
@@ -230,7 +231,7 @@ itemAsCSV (id, Item name contype qty exp) = mconcat
 -- |An SQLite database.
 data SQLiteDB = SQLiteDB FilePath (Maybe SQL.Connection)
 
-data ItemWithID = ItemWithID ID String ContainerType Int
+data ItemWithID = ItemWithID ID String ContainerType Int Date
 
 instance SQL.FromField ContainerType where
    fromField a = case SQL.fieldData a of
@@ -239,13 +240,20 @@ instance SQL.FromField ContainerType where
       SQL.SQLText "can" -> SQL.Ok Can
       SQL.SQLText "jar" -> SQL.Ok Jar
       SQL.SQLText "pack" -> SQL.Ok Pack
-      _ -> SQL.Errors [SomeException
-                       $ SQL.ConversionFailed
-                            "String"
-                            "ContainerType"
-                            "Couldn't parse the container type."]
+      _ -> SQL.Errors [SomeException $
+                       SQL.ConversionFailed "Text" "ContainerType"
+                          "Couldn't parse the container type."]
 
-
+instance SQL.FromField Date where
+   fromField a = case SQL.fieldData a of
+      SQL.SQLText t -> case P.parse readDate "" t of
+         Right d -> SQL.Ok d
+         Left _ -> SQL.Errors [SomeException $
+                               SQL.ConversionFailed "Text" "Date"
+                                  "Couldn't parse date format."]
+      _ -> SQL.Errors [SomeException $
+                       SQL.ConversionFailed "Text" "Date"
+                          "Couldn't parse date format."]
 
 instance SQL.ToField ContainerType where
    toField Bag = SQL.SQLText "bag"
@@ -263,10 +271,10 @@ instance SQL.ToField Date where
                               show y]
 
 instance SQL.FromRow ItemWithID where
-   fromRow = ItemWithID <$> SQL.field <*> SQL.field <*> SQL.field <*> SQL.field
+   fromRow = ItemWithID <$> SQL.field <*> SQL.field <*> SQL.field <*> SQL.field <*> SQL.field
 
 instance SQL.ToRow ItemWithID where
-   toRow (ItemWithID id name ct qty) = SQL.toRow (id, name, ct, qty)
+   toRow (ItemWithID id name ct qty date) = SQL.toRow (id, name, ct, qty, date)
 
 -- App state
 -------------------------------------------------------------------------------
