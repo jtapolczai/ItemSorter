@@ -1,6 +1,10 @@
-{-# LANGUAGE OverloadedStrings,
-             ScopedTypeVariables,
-             TypeFamilies #-}
+{-# LANGUAGE
+   FlexibleInstances,
+   FunctionalDependencies,
+   MultiParamTypeClasses,
+   OverloadedStrings,
+   ScopedTypeVariables,
+   TypeFamilies #-}
 
 module ItemSorter where
 
@@ -11,6 +15,7 @@ import Control.Monad.State (StateT(..), evalStateT, get, put)
 import Data.Char (toLower)
 import Data.Int (Int64)
 import qualified Data.Map as M
+import Data.Maybe (fromJust)
 import Data.List (sortBy, partition)
 import Data.Ord (comparing)
 import qualified Data.Text as T
@@ -172,19 +177,21 @@ class Database db where
    -- |Writes the database back. Only this operation is required to
    --  persist the data so it can be loaded back later.
    persistItems :: db -> IO ()
-   -- |Filters the database.
-   selectItems :: (DBItem db -> Bool) -> db -> IO (DBItems db)
    -- |Gets all items.
    getItems :: db -> IO (DBItems db)
-   getItems = selectItems (const True)
    -- |Gets a single item.
    getItem :: Id db -> db -> IO (Maybe (DBItem db))
    -- |Deletes an item from the database.
-   deleteItem :: db -> Id db -> IO (db)
+   deleteItem :: db -> Id db -> IO db
    -- |Adds an item to the database.
    addItem :: db -> DBItem db -> IO ((db, Id db))
    -- |Updates an item in the datavase.
-   updateItem :: db -> Id db -> (DBItem db -> DBItem db) -> IO (db)
+   updateItem :: db -> Id db -> (DBItem db -> DBItem db) -> IO db
+
+-- |Databases that support filtering their elements.
+class Database db => Filterable db where
+   -- |Filters the database.
+   selectItems :: (DBItem db -> Bool) -> db -> IO (DBItems db)
 
 
 -- CSV DB
@@ -208,7 +215,8 @@ instance Database CSVDB where
       out <- openFile fp WriteMode
       mapM_ (hPutStrLn out) . map itemAsCSV . M.toList $ db
 
-   selectItems f (CSVDB _ db) = return $ M.filter f db
+   getItems (CSVDB _ db) = return db
+
    getItem id (CSVDB _ db) = return $ M.lookup id db
 
    deleteItem (CSVDB fp db) id = return $ CSVDB fp (M.delete id db)
@@ -217,6 +225,8 @@ instance Database CSVDB where
          newId = if M.null db then 0 else (+1) . fst . M.findMax $ db
    updateItem (CSVDB fp db) id f = return $ CSVDB fp (M.adjust f id db)
 
+instance Filterable CSVDB where
+   selectItems f (CSVDB _ db) = return $ M.filter f db
 
 -- |Reads an item list from a file and returns the items in a map.
 readItemList :: FilePath -> IO (Either P.ParseError (M.Map ID Item))
@@ -280,10 +290,68 @@ instance SQL.FromRow ItemWithID where
 instance SQL.ToRow ItemWithID where
    toRow (ItemWithID id name ct qty date) = SQL.toRow (id, name, ct, qty, date)
 
+class Iso a b | a -> b, b -> a where
+   to :: a -> b
+   from :: b -> a
+
+instance Iso ItemWithID (ID, Item) where
+   to (ItemWithID id name ct qty date) = (id, Item name ct qty date)
+   from (id, Item name ct qty date) = (ItemWithID id name ct qty date)
+
+-- |All operations immediately perform IO. 'persistItems' is not necessary.
 instance Database SQLiteDB where
    type DBItems SQLiteDB = M.Map ID Item
    type DBItem SQLiteDB = Item
    type Id SQLiteDB = Int64
+
+   loadItems (SQLiteDB fp oldConn) = do
+      maybe (return ()) SQL.close oldConn
+      newConn <- SQL.open fp
+      SQL.execute_ newConn "CREATE TABLE IF NOT EXISTS tbl (iname TEXT, ct TEXT, qty INTEGER, date TEXT)"
+      return $ SQLiteDB fp $ Just newConn
+
+   -- |As all operations immediately perform IO, this does nothing.
+   persistItems _ = return ()
+
+   getItems (SQLiteDB _ conn) = do
+      res <- SQL.query_ (fromJust conn) "SELECT rowid, * FROM tbl" :: IO [ItemWithID]
+      return $ M.fromList $ map to res
+
+   getItem id (SQLiteDB _ conn) = do
+      res <- SQL.query (fromJust conn) "SELECT rowid, * FROM tbl WHERE rowid = ?" (SQL.Only id) :: IO [ItemWithID]
+      return $ if null res then Nothing else Just $ snd $ to (head res)
+
+   deleteItem db@(SQLiteDB _ conn) id = do
+      SQL.execute (fromJust conn) "DELETE FROM tbl WHERE rowid = ?" (SQL.Only id)
+      return db
+
+   addItem db@(SQLiteDB _ conn) item = do
+      SQL.execute (fromJust conn)
+                  "INSERT INTO tbl (iname, ct, qty, date) VALUES (?,?,?,?)"
+                  (_itemName item,
+                   _itemContainerType item,
+                   _itemQuantity item,
+                   _itemExpiration item)
+      id <- SQL.lastInsertRowId (fromJust conn)
+      return (db, id)
+
+   updateItem db@(SQLiteDB _ conn) id f = do
+      res <- SQL.query (fromJust conn)
+                       "SELECT rowid, * FROM tbl WHERE rowid = ?"
+                       (SQL.Only id) :: IO [ItemWithID]
+      if null res then return db
+      else do
+         let (_, item) = to $ head res
+             item' = f item
+         SQL.executeNamed (fromJust conn)
+                          "UPDATE tbl SET iname=:name, ct=:ct, qty=:qty, date=:date WHERE rowid=:rowid"
+                          [":name" SQL.:= _itemName item',
+                           ":ct" SQL.:= _itemContainerType item',
+                           ":qty" SQL.:= _itemQuantity item',
+                           ":date" SQL.:= _itemExpiration item',
+                           ":rowid" SQL.:= id]
+         return db
+
 
 
 
