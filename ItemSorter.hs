@@ -1,4 +1,5 @@
 {-# LANGUAGE
+   ExistentialQuantification,
    FlexibleInstances,
    FunctionalDependencies,
    MultiParamTypeClasses,
@@ -53,7 +54,7 @@ data ContainerType = Bag | Bar | Can | Jar | Pack
    deriving (Show, Eq, Ord, Enum, Bounded)
 
 data AppState = AppState {
-   _appStateDB :: SQLiteDB
+   _appStateDB :: SomeDB
 }
 
 -- Date
@@ -302,6 +303,7 @@ instance SQL.FromRow ItemWithID where
 instance SQL.ToRow ItemWithID where
    toRow (ItemWithID id name ct qty date) = SQL.toRow (id, name, ct, qty, date)
 
+-- |The class of isomorphic types.
 class Iso a b | a -> b, b -> a where
    to :: a -> b
    from :: b -> a
@@ -368,7 +370,29 @@ instance Database SQLiteDB where
       SQL.close (fromJust conn)
       return (SQLiteDB fp Nothing)
 
+-- Some database
+-------------------------------------------------------------------------------
 
+data SomeDB = forall db. (Database db,
+                          DBItems db ~ DBItems SomeDB,
+                          DBItem db ~ DBItem SomeDB,
+                          Id db ~ Id SomeDB) => SomeDB db
+
+instance Database SomeDB where
+   type DBItems SomeDB = M.Map ID Item
+   type DBItem SomeDB = Item
+   type Id SomeDB = Int64
+
+   loadItems (SomeDB db) = SomeDB <$> loadItems db
+   persistItems (SomeDB db) = persistItems db
+   getItems (SomeDB db) = getItems db
+   getItem id (SomeDB db) = getItem id db
+   deleteItem (SomeDB db) id = SomeDB <$> deleteItem db id
+   addItem (SomeDB db) item = do
+      (db',id) <- addItem db item
+      return (SomeDB db', id)
+   updateItem (SomeDB db) id f = SomeDB <$> updateItem db id f
+   closeDB (SomeDB db) = SomeDB <$> closeDB db
 
 -- App state
 -------------------------------------------------------------------------------
@@ -377,7 +401,7 @@ data DatabaseType = CSV | SQLite
    deriving (Eq, Ord, Enum, Bounded, Show, Read)
 
 getAppState :: IO AppState
-getAppState = AppState <$> loadItems (SQLiteDB "food.db" Nothing)
+getAppState = AppState <$> loadItems (SomeDB $ SQLiteDB "food.db" Nothing)
 -- (CSVDB "food.csv" M.empty)
 
 -- |Consume n units of an item.
