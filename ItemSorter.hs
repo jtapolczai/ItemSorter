@@ -435,7 +435,7 @@ main = do
    evalStateT repl as
    where
       repl :: StateT AppState IO ()
-      repl = makeREPL [cmdShow, cmdConsume, cmdSave]
+      repl = makeREPL [cmdShow, cmdAdd, cmdConsume, cmdSave]
                       exitCmd
                       unknownCmd
                       PR.prompt
