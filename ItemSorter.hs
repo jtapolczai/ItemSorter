@@ -53,10 +53,6 @@ data Item = Item {
 data ContainerType = Bag | Bar | Can | Jar | Pack
    deriving (Show, Eq, Ord, Enum, Bounded)
 
-data AppState = AppState {
-   _appStateDB :: SomeDB
-}
-
 -- Date
 -------------------------------------------------------------------------------
 
@@ -248,7 +244,11 @@ readItemList fp = P.parse readItems fp <$> T.readFile fp
 -- |Outputs an item and an ID as a line in a CSV-file.
 itemAsCSV :: (Int64, Item) -> String
 itemAsCSV (id, Item name contype qty exp) = mconcat
-   [show id,";",show qty,";",showCT contype,";", T.unpack name, showDate exp]
+   [show id,";",
+    show qty,";",
+    showCT contype,";",
+    T.unpack name, ";",
+    showDate exp]
    where
       showCT = map toLower . show
 
@@ -370,7 +370,7 @@ instance Database SQLiteDB where
       SQL.close (fromJust conn)
       return (SQLiteDB fp Nothing)
 
--- Some database
+-- Some database (existential type)
 -------------------------------------------------------------------------------
 
 data SomeDB = forall db. (Database db,
@@ -397,12 +397,17 @@ instance Database SomeDB where
 -- App state
 -------------------------------------------------------------------------------
 
+data AppState = AppState {
+   _appStateDB :: SomeDB
+}
+
 data DatabaseType = CSV | SQLite
    deriving (Eq, Ord, Enum, Bounded, Show, Read)
 
 getAppState :: IO AppState
-getAppState = AppState <$> loadItems (SomeDB $ SQLiteDB "food.db" Nothing)
--- (CSVDB "food.csv" M.empty)
+getAppState = AppState <$> loadItems db
+   where -- db = SomeDB $ SQLiteDB "food.db" Nothing
+         db = SomeDB $ CSVDB "food.csv" M.empty
 
 -- |Consume n units of an item.
 consumeItem :: (Database db, DBItem db ~ Item) => Int -> Id db -> db -> IO db
