@@ -52,7 +52,7 @@ data ContainerType = Bag | Bar | Can | Jar | Pack
    deriving (Show, Eq, Ord, Enum, Bounded)
 
 data AppState = AppState {
-   _appStateDB :: CSVDB
+   _appStateDB :: SQLiteDB
 }
 
 -- Date
@@ -76,7 +76,7 @@ mkVagueDate y Nothing Nothing = mkDate y 12 31
 
 -- |Creates the latest possibly date (9999.12.31).
 mkMaxDate :: Date
-mkMaxDate = Date 9999 31 12
+mkMaxDate = Date 9999 12 31
 
 -- |Returns the current system date.
 mkCurrentDate :: IO Date
@@ -85,7 +85,7 @@ mkCurrentDate = do
    return $ Date (fromIntegral y) m d
 
 isValidYear :: Year -> Bool
-isValidYear y = y >= 1970 && y < 9999
+isValidYear y = y >= 1970 && y <= 9999
 
 isValidMonth :: Month -> Bool
 isValidMonth m = m >= 1 && m <= 12
@@ -119,7 +119,7 @@ readItem = do
    name <- P.many1 (P.noneOf ";")
    P.char ';'
    expiration <- readDate P.<|> readIndefinite
-   P.endOfLine
+   (P.endOfLine *> return ()) P.<|> P.eof
    return $ (iid, Item name contype qty expiration)
 
 readContainerType :: P.Parsec T.Text () ContainerType
@@ -157,7 +157,7 @@ decimal64 :: P.Parsec T.Text () Int64
 decimal64 = read <$> P.many1 P.digit
 
 readItems :: P.Parsec T.Text () (M.Map ID Item)
-readItems = M.fromList <$> P.many readItem
+readItems = M.fromList <$> (P.many readItem <* P.spaces)
 
 -- |Pads a list to the specified length with copies of an element.
 padLeft :: Int -> a -> [a] -> [a]
@@ -270,12 +270,12 @@ instance SQL.FromField Date where
    fromField a = case SQL.fieldData a of
       SQL.SQLText t -> case P.parse readDate "" t of
          Right d -> SQL.Ok d
-         Left _ -> SQL.Errors [SomeException $
+         Left e -> SQL.Errors [SomeException $
                                SQL.ConversionFailed "Text" "Date"
-                                  "Couldn't parse date format."]
-      _ -> SQL.Errors [SomeException $
+                                  ("Couldn't parse date format: " ++ show t ++ "\n" ++ show e)]
+      t -> SQL.Errors [SomeException $
                        SQL.ConversionFailed "Text" "Date"
-                          "Couldn't parse date format."]
+                          ("Couldn't parse date format: " ++ show t)]
 
 instance SQL.ToField ContainerType where
    toField Bag = SQL.SQLText "bag"
@@ -366,8 +366,12 @@ instance Database SQLiteDB where
 -- App state
 -------------------------------------------------------------------------------
 
+data DatabaseType = CSV | SQLite
+   deriving (Eq, Ord, Enum, Bounded, Show, Read)
+
 getAppState :: IO AppState
-getAppState = AppState <$> loadItems (CSVDB "food.csv" M.empty)
+getAppState = AppState <$> loadItems (SQLiteDB "food.db" Nothing)
+-- (CSVDB "food.csv" M.empty)
 
 -- |Consume n units of an item.
 consumeItem :: (Database db, DBItem db ~ Item) => Int -> Id db -> db -> IO db
@@ -400,12 +404,23 @@ itemsByExpiration today = partitionByDate today . sortBy f . M.toList
    where
       f = comparing (_itemExpiration . snd)
 
+-- |Prints an item in user-friendly format.
 showItem :: Item -> String
 showItem (Item name contype qty expiration) = mconcat
    [show qty, " ", name, " (", map toLower . show $ contype, "): ", showDate expiration]
 
+-- |Prints a date as @d.m.y@.
 showDate :: Date -> String
 showDate (Date y m d) = mconcat [show d, ".", show m, ".", show y]
+
+-- |Converts a CSV db into an SQLite DB.
+csvToSQLiteDB :: FilePath -> FilePath -> IO ()
+csvToSQLiteDB csv sql = do
+   csvdb <- loadItems (CSVDB csv M.empty)
+   sqldb <- loadItems (SQLiteDB sql Nothing)
+   items <- map snd . M.toList <$> getItems csvdb
+   addItems sqldb items
+   return ()
 
 main :: IO ()
 main = do
