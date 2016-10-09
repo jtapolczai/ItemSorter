@@ -12,7 +12,7 @@ module ItemSorter where
 import Control.Exception (SomeException(..))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.State (StateT(..), evalStateT, get, put)
-import Data.Char (toLower)
+import Data.Char (toLower, isSpace)
 import Data.Int (Int64)
 import qualified Data.Map as M
 import Data.Maybe (fromJust)
@@ -28,6 +28,7 @@ import qualified Database.SQLite.Simple.ToField as SQL
 import qualified Text.Parsec as P
 import System.IO (openFile, hPutStrLn, IOMode(..))
 import System.REPL
+import qualified System.REPL.Prompt as PR
 
 -- Types
 -------------------------------------------------------------------------------
@@ -172,7 +173,7 @@ class Database db where
    type DBItems db :: *
    type DBItem db :: *
    type Id db :: *
-   -- |Loads the database.
+   -- |Loads the database and opens a connection, if applicable.
    loadItems :: db -> IO db
    -- |Writes the database back. Only this operation is required to
    --  persist the data so it can be loaded back later.
@@ -195,6 +196,8 @@ class Database db where
       return (db'', id : ids)
    -- |Updates an item in the datavase.
    updateItem :: db -> Id db -> (DBItem db -> DBItem db) -> IO db
+   -- |Closes the database connection.
+   closeDB :: db -> IO db
 
 -- |Databases that support filtering their elements.
 class Database db => Filterable db where
@@ -232,6 +235,7 @@ instance Database CSVDB where
       where
          newId = if M.null db then 0 else (+1) . fst . M.findMax $ db
    updateItem (CSVDB fp db) id f = return $ CSVDB fp (M.adjust f id db)
+   closeDB = return
 
 instance Filterable CSVDB where
    selectItems f (CSVDB _ db) = return $ M.filter f db
@@ -360,6 +364,9 @@ instance Database SQLiteDB where
                            ":rowid" SQL.:= id]
          return db
 
+   closeDB (SQLiteDB fp conn) = do
+      SQL.close (fromJust conn)
+      return (SQLiteDB fp Nothing)
 
 
 
@@ -428,63 +435,82 @@ main = do
    evalStateT repl as
    where
       repl :: StateT AppState IO ()
-      repl = makeREPLSimple [cmdShow, cmdConsume, cmdSave]
+      repl = makeREPL [cmdShow, cmdConsume, cmdSave]
+                      exitCmd
+                      unknownCmd
+                      PR.prompt
+                      defErrorHandler
 
-      cmdShow :: Command (StateT AppState IO) T.Text ()
-      cmdShow = makeCommand
-         "show"
-         (defCommandTest ["show"])
-         "Shows the list of expired and still good items."
-         (\_ -> do
-            today <- liftIO mkCurrentDate
-            items <- (_appStateDB <$> get) >>= liftIO . getItems
-            let (good, expired) = itemsByExpiration today items
-                show' (id, item) = mconcat [padLeft 3 ' ' (show id),
-                                   " - ",
-                                   showItem item]
-            liftIO $ putStrLn "Expired: "
-            liftIO $ putStrLn "------------------------------"
-            mapM_ (liftIO . putStrLn . show') expired
-            liftIO $ putStrLn "Good: "
-            liftIO $ putStrLn "------------------------------"
-            mapM_ (liftIO . putStrLn . show') good)
+unknownCmd :: Command (StateT AppState IO) T.Text ()
+unknownCmd = makeCommandN "" (const True) "" False [] (repeat lineAsker) f
+   where
+      f t ts = if T.all isSpace t && all (T.all isSpace) ts
+               then return ()
+               else liftIO $ PR.putStrLn $ "Unknown command: " `T.append` t `T.append` "."
 
-      cmdConsume :: Command (StateT AppState IO) T.Text ()
-      cmdConsume = makeCommand2
-         "consume"
-         (defCommandTest ["consume <ID> <num>"])
-         "Consumes <num> units of item <ID>"
-         True
-         (posNumAsker "Item ID: ")
-         (posNumAsker "Number of consumed items: ")
-         (\_ (id :: Int64) num -> do
-            db <- _appStateDB <$> get
-            item' <- liftIO $ getItem id db
+exitCmd :: Command (StateT AppState IO) T.Text ()
+exitCmd = makeCommand "exit"
+   (("exit"==) . T.strip)
+   "Exits the program."
+   (\_ -> do db <- _appStateDB <$> get
+             liftIO $ closeDB db
+             return ())
+
+cmdShow :: Command (StateT AppState IO) T.Text ()
+cmdShow = makeCommand
+   "show"
+   (defCommandTest ["show"])
+   "Shows the list of expired and still good items."
+   (\_ -> do
+      today <- liftIO mkCurrentDate
+      items <- (_appStateDB <$> get) >>= liftIO . getItems
+      let (good, expired) = itemsByExpiration today items
+          show' (id, item) = mconcat [padLeft 3 ' ' (show id),
+                             " - ",
+                             showItem item]
+      liftIO $ putStrLn "Expired: "
+      liftIO $ putStrLn "------------------------------"
+      mapM_ (liftIO . putStrLn . show') expired
+      liftIO $ putStrLn "Good: "
+      liftIO $ putStrLn "------------------------------"
+      mapM_ (liftIO . putStrLn . show') good)
+
+cmdConsume :: Command (StateT AppState IO) T.Text ()
+cmdConsume = makeCommand2
+   "consume"
+   (defCommandTest ["consume <ID> <num>"])
+   "Consumes <num> units of item <ID>"
+   True
+   (posNumAsker "Item ID: ")
+   (posNumAsker "Number of consumed items: ")
+   (\_ (id :: Int64) num -> do
+      db <- _appStateDB <$> get
+      item' <- liftIO $ getItem id db
+      case item' of
+         Nothing -> liftIO $ putStrLn ("There's no item with the ID " ++ show id)
+         Just item -> do
+            liftIO $ putStr
+                   $ mconcat ["Eating ", show num, " of ", _itemName item, "... "]
+            db' <- liftIO $ consumeItem num id db
+            put $ AppState db'
+            item' <- liftIO $ getItem id db'
             case item' of
-               Nothing -> liftIO $ putStrLn ("There's no item with the ID " ++ show id)
-               Just item -> do
-                  liftIO $ putStr
-                         $ mconcat ["Eating ", show num, " of ", _itemName item, "... "]
-                  db' <- liftIO $ consumeItem num id db
-                  put $ AppState db'
-                  item' <- liftIO $ getItem id db'
-                  case item' of
-                     Nothing -> liftIO $ putStrLn "none remain."
-                     Just item ->
-                        liftIO $ putStrLn
-                               $ mconcat [show $ _itemQuantity item, " remain."])
+               Nothing -> liftIO $ putStrLn "none remain."
+               Just item ->
+                  liftIO $ putStrLn
+                         $ mconcat [show $ _itemQuantity item, " remain."])
 
-      cmdSave :: Command (StateT AppState IO) T.Text ()
-      cmdSave = makeCommand
-         "save"
-         (defCommandTest ["save"])
-         "Saves the database."
-         (\_ -> do
-            db <- _appStateDB <$> get
-            liftIO $ persistItems db)
+cmdSave :: Command (StateT AppState IO) T.Text ()
+cmdSave = makeCommand
+   "save"
+   (defCommandTest ["save"])
+   "Saves the database."
+   (\_ -> do
+      db <- _appStateDB <$> get
+      liftIO $ persistItems db)
 
-      posNumAsker :: (Read a, Integral a, Applicative m) => PromptMsg -> Asker' m a
-      posNumAsker pr = asker pr genericTypeError isPositive
-         where
-            isPositive = boolPredicate isPos (const $ genericPredicateError "Expected a natural number!")
-            isPos n = pure (n >= 0)
+posNumAsker :: (Read a, Integral a, Applicative m) => PromptMsg -> Asker' m a
+posNumAsker pr = asker pr genericTypeError isPositive
+   where
+      isPositive = boolPredicate isPos (const $ genericPredicateError "Expected a natural number!")
+      isPos n = pure (n >= 0)
