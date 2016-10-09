@@ -33,7 +33,7 @@ import qualified System.REPL.Prompt as PR
 -- Types
 -------------------------------------------------------------------------------
 
-type ItemName = String
+type ItemName = T.Text
 type ID = Int64
 
 type Day = Int
@@ -117,7 +117,7 @@ readItem = do
    P.char ';'
    contype <- readContainerType
    P.char ';'
-   name <- P.many1 (P.noneOf ";")
+   name <- T.pack <$> P.many1 (P.noneOf ";")
    P.char ';'
    expiration <- readDate P.<|> readIndefinite
    (P.endOfLine *> return ()) P.<|> P.eof
@@ -247,7 +247,7 @@ readItemList fp = P.parse readItems fp <$> T.readFile fp
 -- |Outputs an item and an ID as a line in a CSV-file.
 itemAsCSV :: (Int64, Item) -> String
 itemAsCSV (id, Item name contype qty exp) = mconcat
-   [show id,";",show qty,";",showCT contype,";", name, showDate exp]
+   [show id,";",show qty,";",showCT contype,";", T.unpack name, showDate exp]
    where
       showCT = map toLower . show
 
@@ -257,7 +257,7 @@ itemAsCSV (id, Item name contype qty exp) = mconcat
 -- |An SQLite database.
 data SQLiteDB = SQLiteDB FilePath (Maybe SQL.Connection)
 
-data ItemWithID = ItemWithID ID String ContainerType Int Date
+data ItemWithID = ItemWithID ID T.Text ContainerType Int Date
 
 instance SQL.FromField ContainerType where
    fromField a = case SQL.fieldData a of
@@ -414,7 +414,7 @@ itemsByExpiration today = partitionByDate today . sortBy f . M.toList
 -- |Prints an item in user-friendly format.
 showItem :: Item -> String
 showItem (Item name contype qty expiration) = mconcat
-   [show qty, " ", name, " (", map toLower . show $ contype, "): ", showDate expiration]
+   [show qty, " ", T.unpack name, " (", map toLower . show $ contype, "): ", showDate expiration]
 
 -- |Prints a date as @d.m.y@.
 showDate :: Date -> String
@@ -478,7 +478,7 @@ cmdShow = makeCommand
 cmdConsume :: Command (StateT AppState IO) T.Text ()
 cmdConsume = makeCommand2
    "consume"
-   (defCommandTest ["consume <ID> <num>"])
+   (defCommandTest ["consume"])
    "Consumes <num> units of item <ID>"
    True
    (posNumAsker "Item ID: ")
@@ -490,7 +490,7 @@ cmdConsume = makeCommand2
          Nothing -> liftIO $ putStrLn ("There's no item with the ID " ++ show id)
          Just item -> do
             liftIO $ putStr
-                   $ mconcat ["Eating ", show num, " of ", _itemName item, "... "]
+                   $ mconcat ["Eating ", show num, " of ", T.unpack $ _itemName item, "... "]
             db' <- liftIO $ consumeItem num id db
             put $ AppState db'
             item' <- liftIO $ getItem id db'
@@ -509,8 +509,47 @@ cmdSave = makeCommand
       db <- _appStateDB <$> get
       liftIO $ persistItems db)
 
+cmdAdd :: Command (StateT AppState IO) T.Text ()
+cmdAdd = makeCommand4
+   "add"
+   (defCommandTest ["add"])
+   "Adds an item to the database."
+   True
+   (verbatimAsker "Item name: ")
+   containerTypeAsker
+   (posNumAsker "Quantity: ")
+   (vagueDateAsker "Expiration date: ")
+   (\_ name ct qty expiration -> do
+      db <- _appStateDB <$> get
+      (db', id) <- liftIO $ addItem db (Item name ct qty expiration)
+      liftIO $ putStrLn $ "Added item with ID " ++ show id
+      put $ AppState db'
+      )
+
+-- |Asks for a numbers >= 0.
 posNumAsker :: (Read a, Integral a, Applicative m) => PromptMsg -> Asker' m a
 posNumAsker pr = asker pr genericTypeError isPositive
    where
       isPositive = boolPredicate isPos (const $ genericPredicateError "Expected a natural number!")
       isPos n = pure (n >= 0)
+
+-- |Asks for a date between 01.01.1970 and 31.12.9999, where the day and month
+--  may be omitted.
+vagueDateAsker :: Applicative m => PromptMsg -> Asker' m Date
+vagueDateAsker pr = Asker pr parser (pure . Right)
+   where
+      parser t = case P.parse readDate "" t of
+         Left _ -> Left $ genericTypeError "You must enter a valid date between 01.01.1970 and 31.12.9999. Acceptable formats: yyyy, mm.yyyy, dd.mm.yyyy."
+         Right d -> Right d
+
+-- |Asks for a container type (in lowercase).
+containerTypeAsker :: Applicative m => Asker' m ContainerType
+containerTypeAsker = Asker "Continer type (bag, bar, can, jar, pack): " parser (pure . Right)
+   where
+      parser t = case P.parse readContainerType "" t of
+         Left _ -> Left $ genericTypeError "Invalid container type! Valid types are bag, bar, can, jar, and pack."
+         Right ct -> Right ct
+
+-- |Asks for a string, without any parsing or predicate check.
+verbatimAsker :: Applicative m => PromptMsg -> Asker' m T.Text
+verbatimAsker pr = predAsker pr (pure . Right)
